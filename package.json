@@ -7,7 +7,7 @@
   "omp": {
     "name": "vLLM Metrics",
     "description": "Shows prompt/generation throughput, KV cache usage, and request queue from vLLM /metrics",
-    "hooks": "./src/index.ts"
+    "extensions": "./src/index.ts"
   },
   "license": "MIT",
   "devDependencies": {
