@@ -163,7 +163,7 @@ function startPolling(
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
-export default function (pi: HookAPI) {
+export default function (pi: ExtensionAPI) {
   let stopPolling: (() => void) | null = null;
 
   pi.on("session_start", async (_event, ctx) => {
