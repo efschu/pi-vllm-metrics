@@ -10,6 +10,12 @@ interface VllmMetrics {
   requestsWaiting: number | null;
 }
 
+interface CounterSnapshot {
+  promptTokens: number;
+  generationTokens: number;
+  timestamp: number;
+}
+
 interface PluginConfig {
   vllmUrl: string;
   pollInterval: number;
@@ -31,24 +37,22 @@ function parsePrometheus(text: string): Map<string, number> {
   return map;
 }
 
-function extractMetrics(raw: Map<string, number>): VllmMetrics {
+interface RawMetrics {
+  promptTokens: number | null;
+  generationTokens: number | null;
+  kvCacheUsage: number | null;
+  requestsRunning: number | null;
+  requestsWaiting: number | null;
+}
+
+function extractRaw(raw: Map<string, number>): RawMetrics {
   return {
-    promptThroughput: findGauge(raw, "vllm:avg_prompt_throughput_toks_per_s"),
-    generationThroughput: findGauge(raw, "vllm:avg_generation_throughput_toks_per_s"),
-    kvCacheUsage: findGauge(raw, "vllm:gpu_cache_usage_perc"),
+    promptTokens: findGauge(raw, "vllm:prompt_tokens_total"),
+    generationTokens: findGauge(raw, "vllm:generation_tokens_total"),
+    kvCacheUsage: findGauge(raw, "vllm:kv_cache_usage_perc"),
     requestsRunning: findGauge(raw, "vllm:num_requests_running"),
     requestsWaiting: findGauge(raw, "vllm:num_requests_waiting"),
   };
-}
-
-function findGauge(map: Map<string, number>, name: string): number | null {
-  // Prometheus labels use {…} syntax; strip them for matching
-  for (const [key, val] of map) {
-    if (key.startsWith(name) && (key.length === name.length || key[name.length] === "{")) {
-      return val;
-    }
-  }
-  return null;
 }
 
 // ── Status line formatting ───────────────────────────────────────────────────
@@ -76,14 +80,40 @@ function formatStatus(m: VllmMetrics): string {
 
 // ── Polling ──────────────────────────────────────────────────────────────────
 
-async function fetchMetrics(url: string): Promise<VllmMetrics> {
+async function fetchRaw(url: string): Promise<RawMetrics> {
   const resp = await fetch(`${url}/metrics`);
   if (!resp.ok) {
     throw new Error(`vLLM /metrics returned ${resp.status}`);
   }
   const text = await resp.text();
   const raw = parsePrometheus(text);
-  return extractMetrics(raw);
+  return extractRaw(raw);
+}
+
+function computeMetrics(
+  prev: CounterSnapshot | null,
+  curr: RawMetrics,
+): VllmMetrics {
+  const now = Date.now();
+  const result: VllmMetrics = {
+    promptThroughput: null,
+    generationThroughput: null,
+    kvCacheUsage: curr.kvCacheUsage,
+    requestsRunning: curr.requestsRunning,
+    requestsWaiting: curr.requestsWaiting,
+  };
+
+  if (prev !== null && curr.promptTokens !== null && curr.generationTokens !== null) {
+    const dt = (now - prev.timestamp) / 1000;
+    if (dt > 0) {
+      const dp = curr.promptTokens - prev.promptTokens;
+      const dg = curr.generationTokens - prev.generationTokens;
+      if (dp >= 0) result.promptThroughput = dp / dt;
+      if (dg >= 0) result.generationThroughput = dg / dt;
+    }
+  }
+
+  return result;
 }
 
 function startPolling(
@@ -92,11 +122,20 @@ function startPolling(
 ): () => void {
   let timer: ReturnType<typeof setInterval> | null = null;
   let running = true;
+  let prev: CounterSnapshot | null = null;
 
   async function tick() {
     try {
-      const m = await fetchMetrics(config.vllmUrl);
-      update(m, null);
+      const raw = await fetchRaw(config.vllmUrl);
+      const metrics = computeMetrics(prev, raw);
+      if (raw.promptTokens !== null && raw.generationTokens !== null) {
+        prev = {
+          promptTokens: raw.promptTokens,
+          generationTokens: raw.generationTokens,
+          timestamp: Date.now(),
+        };
+      }
+      update(metrics, null);
     } catch (err) {
       update(
         {
