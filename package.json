@@ -1,0 +1,19 @@
+{
+  "name": "@efschu/pi-vllm-metrics",
+  "version": "1.0.0",
+  "description": "Display vLLM engine throughput metrics in the Oh My Pi status line",
+  "type": "module",
+  "main": "./src/index.ts",
+  "omp": {
+    "name": "vLLM Metrics",
+    "description": "Shows prompt/generation throughput, KV cache usage, and request queue from vLLM /metrics",
+    "hooks": "./src/index.ts"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "*"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": ">=0.70.0"
+  }
+}
