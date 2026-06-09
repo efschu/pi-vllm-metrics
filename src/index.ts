@@ -6,6 +6,7 @@ interface VllmMetrics {
   promptThroughput: number | null;
   generationThroughput: number | null;
   kvCacheUsage: number | null;
+  kvGrowthRate: number | null;
   requestsRunning: number | null;
   requestsWaiting: number | null;
 }
@@ -13,7 +14,13 @@ interface VllmMetrics {
 interface CounterSnapshot {
   promptTokens: number;
   generationTokens: number;
+  kvCacheTokens: number;
   timestamp: number;
+}
+
+interface CacheConfig {
+  numGpuBlocks: number;
+  blockSize: number;
 }
 
 interface PluginConfig {
@@ -43,16 +50,38 @@ interface RawMetrics {
   kvCacheUsage: number | null;
   requestsRunning: number | null;
   requestsWaiting: number | null;
+  cacheConfig: CacheConfig | null;
 }
 
 function extractRaw(raw: Map<string, number>): RawMetrics {
+  const cacheConfig = parseCacheConfig(raw);
   return {
     promptTokens: findGauge(raw, "vllm:prompt_tokens_total"),
     generationTokens: findGauge(raw, "vllm:generation_tokens_total"),
     kvCacheUsage: findGauge(raw, "vllm:kv_cache_usage_perc"),
     requestsRunning: findGauge(raw, "vllm:num_requests_running"),
     requestsWaiting: findGauge(raw, "vllm:num_requests_waiting"),
+    cacheConfig,
   };
+}
+
+function parseCacheConfig(raw: Map<string, number>): CacheConfig | null {
+  for (const [key] of raw) {
+    if (key.startsWith("vllm:cache_config_info") && key.includes("{")) {
+      const labels = key.slice(key.indexOf("{") + 1, key.lastIndexOf("}"));
+      const numBlocks = extractLabel(labels, "num_gpu_blocks");
+      const blockSize = extractLabel(labels, "block_size");
+      if (numBlocks !== null && blockSize !== null) {
+        return { numGpuBlocks: numBlocks, blockSize };
+      }
+    }
+  }
+  return null;
+}
+
+function extractLabel(labels: string, name: string): number | null {
+  const match = labels.match(new RegExp(`${name}="(-?\\d+)"`));
+  return match ? parseInt(match[1], 10) : null;
 }
 
 function findGauge(map: Map<string, number>, name: string): number | null {
@@ -76,7 +105,12 @@ function formatStatus(m: VllmMetrics): string {
     parts.push(`G:${m.generationThroughput.toFixed(0)}/s`);
   }
   if (m.kvCacheUsage !== null) {
-    parts.push(`KV:${(m.kvCacheUsage * 100).toFixed(1)}%`);
+    const kv = (m.kvCacheUsage * 100).toFixed(1);
+    if (m.kvGrowthRate !== null) {
+      parts.push(`KV:${kv}% +${m.kvGrowthRate.toFixed(1)}/s`);
+    } else {
+      parts.push(`KV:${kv}%`);
+    }
   }
   if (m.requestsRunning !== null || m.requestsWaiting !== null) {
     const r = m.requestsRunning ?? 0;
@@ -108,17 +142,28 @@ function computeMetrics(
     promptThroughput: null,
     generationThroughput: null,
     kvCacheUsage: curr.kvCacheUsage,
+    kvGrowthRate: null,
     requestsRunning: curr.requestsRunning,
     requestsWaiting: curr.requestsWaiting,
   };
 
-  if (prev !== null && curr.promptTokens !== null && curr.generationTokens !== null) {
+  if (prev !== null) {
     const dt = (now - prev.timestamp) / 1000;
     if (dt > 0) {
-      const dp = curr.promptTokens - prev.promptTokens;
-      const dg = curr.generationTokens - prev.generationTokens;
-      if (dp >= 0) result.promptThroughput = dp / dt;
-      if (dg >= 0) result.generationThroughput = dg / dt;
+      if (curr.promptTokens !== null) {
+        const dp = curr.promptTokens - prev.promptTokens;
+        if (dp >= 0) result.promptThroughput = dp / dt;
+      }
+      if (curr.generationTokens !== null) {
+        const dg = curr.generationTokens - prev.generationTokens;
+        if (dg >= 0) result.generationThroughput = dg / dt;
+      }
+      if (prev.kvCacheTokens !== null && curr.kvCacheUsage !== null && curr.cacheConfig !== null) {
+        const maxTokens = curr.cacheConfig.numGpuBlocks * curr.cacheConfig.blockSize;
+        const currKvTokens = curr.kvCacheUsage * maxTokens;
+        const dkv = currKvTokens - prev.kvCacheTokens;
+        if (dkv >= 0) result.kvGrowthRate = dkv / dt;
+      }
     }
   }
 
@@ -138,9 +183,13 @@ function startPolling(
       const raw = await fetchRaw(config.vllmUrl);
       const metrics = computeMetrics(prev, raw);
       if (raw.promptTokens !== null && raw.generationTokens !== null) {
+        const kvTokens = raw.kvCacheUsage !== null && raw.cacheConfig !== null
+          ? raw.kvCacheUsage * raw.cacheConfig.numGpuBlocks * raw.cacheConfig.blockSize
+          : null;
         prev = {
           promptTokens: raw.promptTokens,
           generationTokens: raw.generationTokens,
+          kvCacheTokens: kvTokens ?? prev?.kvCacheTokens ?? 0,
           timestamp: Date.now(),
         };
       }
@@ -151,6 +200,7 @@ function startPolling(
           promptThroughput: null,
           generationThroughput: null,
           kvCacheUsage: null,
+          kvGrowthRate: null,
           requestsRunning: null,
           requestsWaiting: null,
         },
