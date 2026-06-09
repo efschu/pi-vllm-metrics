@@ -18,14 +18,11 @@ interface CounterSnapshot {
   timestamp: number;
 }
 
-interface CacheConfig {
-  numGpuBlocks: number;
-  blockSize: number;
-}
 
 interface PluginConfig {
   vllmUrl: string;
   pollInterval: number;
+  maxContextTokens: number;
 }
 
 // ── Prometheus parser ────────────────────────────────────────────────────────
@@ -50,38 +47,16 @@ interface RawMetrics {
   kvCacheUsage: number | null;
   requestsRunning: number | null;
   requestsWaiting: number | null;
-  cacheConfig: CacheConfig | null;
 }
 
 function extractRaw(raw: Map<string, number>): RawMetrics {
-  const cacheConfig = parseCacheConfig(raw);
   return {
     promptTokens: findGauge(raw, "vllm:prompt_tokens_total"),
     generationTokens: findGauge(raw, "vllm:generation_tokens_total"),
     kvCacheUsage: findGauge(raw, "vllm:kv_cache_usage_perc"),
     requestsRunning: findGauge(raw, "vllm:num_requests_running"),
     requestsWaiting: findGauge(raw, "vllm:num_requests_waiting"),
-    cacheConfig,
   };
-}
-
-function parseCacheConfig(raw: Map<string, number>): CacheConfig | null {
-  for (const [key] of raw) {
-    if (key.startsWith("vllm:cache_config_info") && key.includes("{")) {
-      const labels = key.slice(key.indexOf("{") + 1, key.lastIndexOf("}"));
-      const numBlocks = extractLabel(labels, "num_gpu_blocks");
-      const blockSize = extractLabel(labels, "block_size");
-      if (numBlocks !== null && blockSize !== null) {
-        return { numGpuBlocks: numBlocks, blockSize };
-      }
-    }
-  }
-  return null;
-}
-
-function extractLabel(labels: string, name: string): number | null {
-  const match = labels.match(new RegExp(`${name}="(-?\\d+)"`));
-  return match ? parseInt(match[1], 10) : null;
 }
 
 function findGauge(map: Map<string, number>, name: string): number | null {
@@ -136,6 +111,7 @@ async function fetchRaw(url: string): Promise<RawMetrics> {
 function computeMetrics(
   prev: CounterSnapshot | null,
   curr: RawMetrics,
+  maxContextTokens: number,
 ): VllmMetrics {
   const now = Date.now();
   const result: VllmMetrics = {
@@ -158,9 +134,8 @@ function computeMetrics(
         const dg = curr.generationTokens - prev.generationTokens;
         if (dg >= 0) result.generationThroughput = dg / dt;
       }
-      if (prev.kvCacheTokens !== null && curr.kvCacheUsage !== null && curr.cacheConfig !== null) {
-        const maxTokens = curr.cacheConfig.numGpuBlocks * curr.cacheConfig.blockSize;
-        const currKvTokens = curr.kvCacheUsage * maxTokens;
+      if (prev.kvCacheTokens !== null && curr.kvCacheUsage !== null) {
+        const currKvTokens = curr.kvCacheUsage * maxContextTokens;
         const dkv = currKvTokens - prev.kvCacheTokens;
         if (dkv >= 0) result.kvGrowthRate = dkv / dt;
       }
@@ -181,10 +156,10 @@ function startPolling(
   async function tick() {
     try {
       const raw = await fetchRaw(config.vllmUrl);
-      const metrics = computeMetrics(prev, raw);
+      const metrics = computeMetrics(prev, raw, config.maxContextTokens);
       if (raw.promptTokens !== null && raw.generationTokens !== null) {
-        const kvTokens = raw.kvCacheUsage !== null && raw.cacheConfig !== null
-          ? raw.kvCacheUsage * raw.cacheConfig.numGpuBlocks * raw.cacheConfig.blockSize
+        const kvTokens = raw.kvCacheUsage !== null
+          ? raw.kvCacheUsage * config.maxContextTokens
           : null;
         prev = {
           promptTokens: raw.promptTokens,
@@ -228,11 +203,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     const vllmUrl = process.env.VLLM_METRICS_URL || "http://192.168.0.11:8010";
     const pollInterval = parseInt(process.env.VLLM_METRICS_POLL_MS || "3000", 10);
+    const maxContextTokens = parseInt(process.env.VLLM_METRICS_MAX_CTX || "218000", 10);
 
     // Clear previous status
     ctx.ui.setStatus("vllm-metrics", undefined);
 
-    stopPolling = startPolling({ vllmUrl, pollInterval }, (metrics, error) => {
+    stopPolling = startPolling({ vllmUrl, pollInterval, maxContextTokens }, (metrics, error) => {
       if (error) {
         const theme = ctx.ui.theme;
         ctx.ui.setStatus(
