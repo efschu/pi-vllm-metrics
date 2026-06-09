@@ -55,6 +55,15 @@ function extractRaw(raw: Map<string, number>): RawMetrics {
   };
 }
 
+function findGauge(map: Map<string, number>, name: string): number | null {
+  for (const [key, val] of map) {
+    if (key.startsWith(name) && (key.length === name.length || key[name.length] === "{")) {
+      return val;
+    }
+  }
+  return null;
+}
+
 // ── Status line formatting ───────────────────────────────────────────────────
 
 function formatStatus(m: VllmMetrics): string {
